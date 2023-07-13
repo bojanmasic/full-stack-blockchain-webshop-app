@@ -1,0 +1,3 @@
+Nalog
+Private key: 5JDTZ7E7xZF2GYwZZvAusKQLLGVF19xdvTRiZNd8niGoQbQHrjr
+Public key: INE5ogfZgYoXmeByig3kjreqoDBqVUm8jZwYQvL6CdAdvUVjcX7re
