@@ -1,0 +1,611 @@
+codeunit 50100 "BCY GitHub Integration"
+{
+    procedure FetchIssues()
+    var
+        Setup: Record "BCY GitHub Setup";
+        Client: HttpClient;
+        Response: HttpResponseMessage;
+        Url: Text;
+        Headers: HttpHeaders;
+        JsonArray: JsonArray;
+        JsonIssue: JsonObject;
+        JsonToken: JsonToken;
+        ValueToken: JsonToken;
+        Content: Text;
+        TempBlob: Codeunit "Temp Blob";
+        OutStream: OutStream;
+        InStream: InStream;
+        Issue: Record "BCY GitHub Issue";
+        HttpResponseErrosLbl: Label 'Error: %1', Comment = '%1 - Reason phrase or additional error details from the server.';
+        AssigneeJson: JsonObject;
+        UserJson: JsonObject;
+        LabelsJson: JsonArray;
+        LabelText: Text;
+        i: Integer;
+    begin
+        Setup.Get();
+        if (Setup."Repo Owner" = '') or (Setup."Repo Name" = '') then
+            Error('Repository owner and name must be configured in setup.');
+
+        Url := StrSubstNo('https://api.github.com/repos/%1/%2/issues?state=all', Setup."Repo Owner", Setup."Repo Name");
+
+        Client.DefaultRequestHeaders.Add('Authorization', StrSubstNo('Bearer %1', Setup."GitHub Token"));
+        Client.DefaultRequestHeaders.Add('User-Agent', 'PostmanRuntime/7.43.0');
+        if Client.Get(Url, Response) then
+            if not Response.IsSuccessStatusCode() then
+                Error(HttpResponseErrosLbl, Response.ReasonPhrase);
+        Response.Content.ReadAs(Content);
+        JsonArray.ReadFrom(Content);
+
+        Issue.SetRange("Repo Owner", Setup."Repo Owner");
+        Issue.SetRange("Repo Name", Setup."Repo Name");
+        Issue.DeleteAll();
+
+        foreach JsonToken in JsonArray do begin
+            JsonIssue := JsonToken.AsObject();
+            Issue.Init();
+
+            if JsonIssue.Get('number', ValueToken) then
+                Issue."Issue ID" := ValueToken.AsValue().AsInteger();
+
+            if JsonIssue.Get('title', ValueToken) then
+                Issue.Title := CopyStr(ValueToken.AsValue().AsText(), 1, MaxStrLen(Issue.Title));
+
+            if JsonIssue.Get('state', ValueToken) then
+                if ValueToken.AsValue().AsText().ToLower() = 'open' then
+                    Issue.State := Issue.State::Open
+                else
+                    Issue.State := Issue.State::Closed;
+
+            if JsonIssue.Get('created_at', ValueToken) then
+                Evaluate(Issue."Created At", ValueToken.AsValue().AsText());
+
+            if JsonIssue.Get('updated_at', ValueToken) then
+                Evaluate(Issue."Updated At", ValueToken.AsValue().AsText());
+
+            if JsonIssue.Get('body', ValueToken) then
+                if not ValueToken.AsValue().IsNull then
+                    Issue.Description := CopyStr(ValueToken.AsValue().AsText(), 1, MaxStrLen(Issue.Description));
+
+            if JsonIssue.Get('closed_at', ValueToken) then
+                if not ValueToken.AsValue().IsNull then
+                    Evaluate(Issue."Closed At", ValueToken.AsValue().AsText());
+
+            if JsonIssue.Get('closed_by', ValueToken) then
+                if not ValueToken.AsValue().IsNull then
+                    Issue."Closed By" := CopyStr(ValueToken.AsValue().AsText(), 1, MaxStrLen(Issue."Closed By"));
+
+            if JsonIssue.Get('user', ValueToken) then
+                if ValueToken.AsObject().Get('login', ValueToken) then
+                    Issue.Author := CopyStr(ValueToken.AsValue().AsText(), 1, MaxStrLen(Issue.Author));
+
+            if JsonIssue.Get('comments', ValueToken) then
+                Issue."Comments Count" := ValueToken.AsValue().AsInteger();
+
+            if JsonIssue.Get('labels', ValueToken) then begin
+                LabelsJson := ValueToken.AsArray();
+                LabelText := '';
+                for i := 0 to LabelsJson.Count - 1 do begin
+                    LabelsJson.Get(i, ValueToken);
+                    if ValueToken.AsObject().Get('name', ValueToken) then
+                        LabelText += ValueToken.AsValue().AsText() + ', ';
+                end;
+                Issue.Labels := CopyStr(LabelText.TrimEnd(', '), 1, MaxStrLen(Issue.Labels));
+            end;
+
+            Issue."Repo Owner" := Setup."Repo Owner";
+            Issue."Repo Name" := Setup."Repo Name";
+            Issue."Issue No." := Issue.GetLastIssueNo() + 1;
+            if Issue."Comments Count" > 0 then
+                FetchComments(Issue);
+            Issue.Insert();
+        end;
+    end;
+
+    procedure FetchComments(var GithubIssue: Record "BCY GitHub Issue");
+    var
+        Setup: Record "BCY GitHub Setup";
+        Client: HttpClient;
+        Response: HttpResponseMessage;
+        Url: Text;
+        Headers: HttpHeaders;
+        JsonArray: JsonArray;
+        JsonComment: JsonObject;
+        JsonToken: JsonToken;
+        ValueToken: JsonToken;
+        Content: Text;
+        Comment: Record "BCY GitHub Issue Comment";
+        LastComment: Record "BCY GitHub Issue Comment";
+        HttpResponseErrorsLbl: Label 'Error: %1', Comment = '%1 - Reason phrase or additional error details from the server.';
+    begin
+        Setup.Get();
+        if (Setup."Repo Owner" = '') or (Setup."Repo Name" = '') then
+            Error('Repository owner and name must be configured in setup.');
+
+        Url := StrSubstNo('https://api.github.com/repos/%1/%2/issues/%3/comments', Setup."Repo Owner", Setup."Repo Name", GithubIssue."Issue ID");
+
+        Client.DefaultRequestHeaders.Add('Authorization', StrSubstNo('Bearer %1', Setup."GitHub Token"));
+        Client.DefaultRequestHeaders.Add('User-Agent', 'PostmanRuntime/7.43.0');
+
+        if not Client.Get(Url, Response) then
+            Error('Failed to fetch comments.');
+        if not Response.IsSuccessStatusCode() then
+            exit;
+
+        Response.Content.ReadAs(Content);
+        JsonArray.ReadFrom(Content);
+
+        foreach JsonToken in JsonArray do begin
+            JsonComment := JsonToken.AsObject();
+            if JsonComment.Get('id', ValueToken) then begin
+                Comment.SetRange("Comment ID", ValueToken.AsValue().AsBigInteger());
+                if Comment.IsEmpty() then begin
+                    Comment.Reset();
+                    Comment.Init();
+                    Comment."Comment ID" := ValueToken.AsValue().AsBigInteger();
+                    Comment."Issue No." := GithubIssue."Issue No.";
+                    Comment."Issue ID" := GithubIssue."Issue ID";
+
+                    LastComment.SetRange("Issue No.", GithubIssue."Issue No.");
+                    if LastComment.FindLast() then
+                        Comment."Comment No." := LastComment."Comment No." + 1
+                    else
+                        Comment."Comment No." := 1;
+
+                    if JsonComment.Get('user', ValueToken) then
+                        if ValueToken.AsObject().Get('login', ValueToken) then
+                            Comment."User Login" := CopyStr(ValueToken.AsValue().AsText(), 1, MaxStrLen(Comment."User Login"));
+
+                    if JsonComment.Get('created_at', ValueToken) then
+                        Evaluate(Comment."Created At", ValueToken.AsValue().AsText());
+
+                    if JsonComment.Get('updated_at', ValueToken) then
+                        Evaluate(Comment."Updated At", ValueToken.AsValue().AsText());
+
+                    if JsonComment.Get('body', ValueToken) then
+                        Comment.Validate(Comment.Body, CopyStr(ValueToken.AsValue().AsText(), 1, MaxStrLen(Comment.Body)));
+
+                    if JsonComment.Get('html_url', ValueToken) then
+                        Comment.URL := CopyStr(ValueToken.AsValue().AsText(), 1, MaxStrLen(Comment.URL));
+
+                    Comment.Insert();
+                end;
+            end;
+        end;
+    end;
+
+    procedure SyncIssue(Title: Text; Body: Text; var IssueID: Integer)
+    var
+        Setup: Record "BCY GitHub Setup";
+        Client: HttpClient;
+        Request: HttpRequestMessage;
+        Response: HttpResponseMessage;
+        RequestHeaders: HttpHeaders;
+        ContentHeaders: HttpHeaders;
+        Url: Text;
+        Content: HttpContent;
+        JsonBody: Text;
+        ResponseText: Text;
+        JsonObj: JsonObject;
+        JsonToken: JsonToken;
+        IsUpdate: Boolean;
+        ActionText: Text;
+    begin
+        Setup.Get();
+        if (Setup."Repo Owner" = '') or (Setup."Repo Name" = '') then
+            Error('Repository owner and name must be configured in setup.');
+
+        IsUpdate := (IssueID > 0);
+
+        if IsUpdate then
+            Url := StrSubstNo('https://api.github.com/repos/%1/%2/issues/%3',
+                              Setup."Repo Owner", Setup."Repo Name", IssueID)
+        else
+            Url := StrSubstNo('https://api.github.com/repos/%1/%2/issues',
+                              Setup."Repo Owner", Setup."Repo Name");
+
+        JsonBody := StrSubstNo('{"title": "%1", "body": "%2"}', Title, Body);
+        Content.WriteFrom(JsonBody);
+
+        Content.GetHeaders(ContentHeaders);
+        ContentHeaders.Clear();
+        ContentHeaders.Add('Content-Type', 'application/json');
+
+        if IsUpdate then
+            Request.Method := 'PATCH'
+        else
+            Request.Method := 'POST';
+
+        Request.SetRequestUri(Url);
+        Request.Content := Content;
+
+        Request.GetHeaders(RequestHeaders);
+        RequestHeaders.Add('Authorization', StrSubstNo('Bearer %1', Setup."GitHub Token"));
+        RequestHeaders.Add('User-Agent', 'BusinessCentral');
+        RequestHeaders.Add('Accept', 'application/vnd.github.v3+json');
+
+        if not Client.Send(Request, Response) then
+            Error('Failed to connect to GitHub.');
+
+        if not Response.IsSuccessStatusCode() then begin
+            if IsUpdate then
+                ActionText := 'update'
+            else
+                ActionText := 'create';
+            Error('Failed to %1 issue: %2', ActionText, Response.ReasonPhrase);
+        end;
+
+        if not IsUpdate then begin
+            Response.Content.ReadAs(ResponseText);
+            if not JsonObj.ReadFrom(ResponseText) then
+                Error('Unexpected response from GitHub.');
+
+            if JsonObj.Get('number', JsonToken) then
+                IssueID := JsonToken.AsValue().AsInteger();
+        end;
+
+        if IsUpdate then
+            Message('Updated GitHub Issue #%1 successfully.', IssueID)
+        else
+            Message('Created GitHub Issue #%1 successfully.', IssueID);
+
+    end;
+
+    local procedure PostSingleComment(IssueID: Integer; var CommentRec: Record "BCY GitHub Issue Comment")
+    var
+        Setup: Record "BCY GitHub Setup";
+        Attachment: Record "BCY GitHub Issue Attachment";
+        CleanBody: Text;
+        DownloadURL: Text;
+        Client: HttpClient;
+        Request: HttpRequestMessage;
+        RequestHeaders: HttpHeaders;
+        Response: HttpResponseMessage;
+        Content: HttpContent;
+        Url: Text;
+        JsonBody: Text;
+        ResponseText: Text;
+        JsonObj: JsonObject;
+        JsonToken: JsonToken;
+        NewCommentID: BigInteger;
+        NonAttachmentBody: Text;
+        HaveAttachment: Boolean;
+    begin
+        Setup.Get();
+        Url := StrSubstNo(
+          'https://api.github.com/repos/%1/%2/issues/%3/comments',
+          Setup."Repo Owner", Setup."Repo Name", IssueID);
+
+        Request.Method := 'POST';
+        Request.SetRequestUri(Url);
+        Request.GetHeaders(RequestHeaders);
+        RequestHeaders.Add('Authorization', StrSubstNo('Bearer %1', Setup."GitHub Token"));
+        RequestHeaders.Add('User-Agent', 'BusinessCentral');
+        RequestHeaders.Add('Accept', 'application/vnd.github.v3+json');
+
+
+        CleanBody := CommentRec.GetCommentHtmlBody();
+        NonAttachmentBody := CommentRec.Body;
+
+        Attachment.Reset();
+        Attachment.SetRange(IssueNo, CommentRec."Issue No.");
+        Attachment.SetRange(CommentNo, CommentRec."Comment No.");
+        if Attachment.FindSet() then begin
+            repeat
+                HaveAttachment := true;
+                DownloadURL := UploadAttachmentToGitHub(Attachment, IssueID);
+                Clear(Attachment.Base64Code);
+                CleanBody := ReplaceBase64WithUrls(CleanBody, Attachment, DownloadURL);
+            until Attachment.Next() = 0;
+        end;
+
+        if HaveAttachment = true then
+            JsonBody := '{"body": "' + FormatBody(CleanBody) + '"}'
+        else
+            JsonBody := '{"body": "' + FormatBody(NonAttachmentBody) + '"}';
+        Content.WriteFrom(JsonBody);
+
+        Content.GetHeaders(RequestHeaders);
+        RequestHeaders.Clear();
+        RequestHeaders.Add('Content-Type', 'application/json');
+        Request.Content := Content;
+
+        if not Client.Send(Request, Response) then
+            Error('Failed to connect to GitHub.');
+        if not Response.IsSuccessStatusCode() then
+            Error('Failed to post comment: %1', Response.ReasonPhrase);
+
+        Response.Content.ReadAs(ResponseText);
+        if not JsonObj.ReadFrom(ResponseText) then
+            Error('Unexpected response from GitHub.');
+
+        if JsonObj.Get('user', JsonToken) then
+            if JsonToken.AsObject().Get('login', JsonToken) then
+                CommentRec."User Login" := CopyStr(JsonToken.AsValue().AsText(), 1, MaxStrLen(CommentRec."User Login"));
+
+        if JsonObj.Get('created_at', JsonToken) then
+            Evaluate(CommentRec."Created At", JsonToken.AsValue().AsText());
+
+        if JsonObj.Get('updated_at', JsonToken) then
+            Evaluate(CommentRec."Updated At", JsonToken.AsValue().AsText());
+
+        if JsonObj.Get('html_url', JsonToken) then
+            CommentRec.URL := CopyStr(JsonToken.AsValue().AsText(), 1, MaxStrLen(CommentRec.URL));
+
+        if JsonObj.Get('id', JsonToken) then
+            NewCommentID := JsonToken.AsValue().AsBigInteger();
+
+        if JsonObj.Get('body', JsonToken) then
+            CommentRec.Validate(CommentRec.Body, CopyStr(JsonToken.AsValue().AsText(), 1, MaxStrLen(CommentRec.Body)));
+        Attachment.DeleteAll();
+        CommentRec."Comment ID" := NewCommentID;
+        CommentRec."Issue ID" := IssueID;
+        CommentRec.Modify();
+    end;
+
+    procedure PostAllLocalComments(GitHubIssue: Record "BCY GitHub Issue")
+    var
+        Setup: Record "BCY GitHub Setup";
+        GitHubIssueComment: Record "BCY GitHub Issue Comment";
+        CommentsPosted: Integer;
+    begin
+        Setup.Get();
+        if (Setup."Repo Owner" = '') or (Setup."Repo Name" = '') then
+            Error('Repository owner and name must be configured in setup.');
+
+        GitHubIssueComment.Reset();
+        GitHubIssueComment.SetRange("Issue No.", GitHubIssue."Issue No.");
+        GitHubIssueComment.SetFilter(GitHubIssueComment.SystemModifiedAt, '>%1', GitHubIssue.LastSyncTime);
+        if GitHubIssueComment.FindSet() then
+            repeat
+                if GitHubIssueComment."Comment ID" = 0 then
+                    PostSingleComment(GitHubIssue."Issue Id", GitHubIssueComment)
+                else
+                    UpdateCommentOnGitHub(GitHubIssueComment);
+                CommentsPosted += 1;
+            until GitHubIssueComment.Next() = 0;
+    end;
+
+    local procedure UpdateCommentOnGitHub(var CommentRec: Record "BCY GitHub Issue Comment")
+    var
+        Setup: Record "BCY GitHub Setup";
+        Attachment: Record "BCY GitHub Issue Attachment";
+        CleanBody: Text;
+        DownloadURL: Text;
+        Client: HttpClient;
+        Request: HttpRequestMessage;
+        RequestHeaders: HttpHeaders;
+        Response: HttpResponseMessage;
+        Content: HttpContent;
+        JsonObj: JsonObject;
+        JsonToken: JsonToken;
+        Url: Text;
+        JsonBody: Text;
+        ResponseText: Text;
+        NonAttachmentBody: Text;
+        HaveAttachment: Boolean;
+    begin
+        Setup.Get();
+        Url := StrSubstNo(
+          'https://api.github.com/repos/%1/%2/issues/comments/%3',
+          Setup."Repo Owner", Setup."Repo Name", CommentRec."Comment ID");
+
+        Request.Method := 'PATCH';
+        Request.SetRequestUri(Url);
+        Request.GetHeaders(RequestHeaders);
+        RequestHeaders.Add('Authorization', StrSubstNo('Bearer %1', Setup."GitHub Token"));
+        RequestHeaders.Add('User-Agent', 'BusinessCentral');
+        RequestHeaders.Add('Accept', 'application/vnd.github.v3+json');
+
+        CleanBody := CommentRec.GetCommentHtmlBody();
+        NonAttachmentBody := CommentRec.Body;
+
+        Attachment.Reset();
+        Attachment.SetRange(IssueNo, CommentRec."Issue No.");
+        Attachment.SetRange(CommentNo, CommentRec."Comment No.");
+        if Attachment.FindSet() then begin
+            repeat
+                HaveAttachment := true;
+                DownloadURL := UploadAttachmentToGitHub(Attachment, CommentRec."Issue ID");
+                Clear(Attachment.Base64Code);
+                CleanBody := ReplaceBase64WithUrls(CleanBody, Attachment, DownloadURL);
+            until Attachment.Next() = 0;
+        end;
+        if HaveAttachment = true then
+            JsonBody := '{"body": "' + FormatBody(CleanBody) + '"}'
+        else
+            JsonBody := '{"body": "' + FormatBody(NonAttachmentBody) + '"}';
+
+        Content.WriteFrom(JsonBody);
+
+        Content.GetHeaders(RequestHeaders);
+        RequestHeaders.Clear();
+        RequestHeaders.Add('Content-Type', 'application/json');
+        Request.Content := Content;
+
+        if not Client.Send(Request, Response) then
+            Error('Failed to connect to GitHub.');
+        if not Response.IsSuccessStatusCode() then
+            Error('Failed to update comment: %1', Response.ReasonPhrase);
+
+        Response.Content.ReadAs(ResponseText);
+        if not JsonObj.ReadFrom(ResponseText) then
+            Error('Unexpected response from GitHub.');
+        if JsonObj.Get('body', JsonToken) then
+            CommentRec.Validate(CommentRec.Body, CopyStr(JsonToken.AsValue().AsText(), 1, MaxStrLen(CommentRec.Body)));
+        Attachment.DeleteAll();
+    end;
+
+    local procedure UploadAttachmentToGitHub(var Attachment: Record "BCY GitHub Issue Attachment"; IssueID: Integer): Text
+    var
+        Setup: Record "BCY GitHub Setup";
+        Client: HttpClient;
+        GetRequest: HttpRequestMessage;
+        PutRequest: HttpRequestMessage;
+        RequestHeaders: HttpHeaders;
+        Response: HttpResponseMessage;
+        Content: HttpContent;
+        Url: Text;
+        JsonBody: Text;
+        ResponseText: Text;
+        JsonObj: JsonObject;
+        JsonToken: JsonToken;
+        Base64Data: Text;
+    begin
+        Setup.Get();
+
+        Url := StrSubstNo(
+            'https://api.github.com/repos/%1/%2/contents/images/issue-%3/%4',
+            Setup."Repo Owner",
+            Setup."Repo Name",
+            IssueID,
+            Attachment.FileName
+        );
+
+        GetRequest.Method := 'GET';
+        GetRequest.SetRequestUri(Url);
+        GetRequest.GetHeaders(RequestHeaders);
+        RequestHeaders.Add('Authorization', StrSubstNo('Bearer %1', Setup."GitHub Token"));
+        RequestHeaders.Add('User-Agent', 'BusinessCentral');
+        RequestHeaders.Add('Accept', 'application/vnd.github.v3+json');
+
+        if Client.Send(GetRequest, Response) then begin
+            if Response.IsSuccessStatusCode() then begin
+                Response.Content.ReadAs(ResponseText);
+                if JsonObj.ReadFrom(ResponseText) and JsonObj.Get('download_url', JsonToken) then
+                    exit(JsonToken.AsValue().AsText());
+            end;
+        end else
+            Error('Failed to check file existence on GitHub. Check network or authentication.');
+
+        Base64Data := Attachment.GetCommentHtmlBody();
+
+        PutRequest.Method := 'PUT';
+        PutRequest.SetRequestUri(Url);
+        PutRequest.GetHeaders(RequestHeaders);
+        RequestHeaders.Add('Authorization', StrSubstNo('Bearer %1', Setup."GitHub Token"));
+        RequestHeaders.Add('User-Agent', 'BusinessCentral');
+        RequestHeaders.Add('Accept', 'application/vnd.github.v3+json');
+
+        JsonBody := StrSubstNo(
+            '{"message": "Added attachment for issue %1",' +
+            '"content": "%2"}',
+            IssueID,
+            Base64Data
+        );
+
+        Content.WriteFrom(JsonBody);
+        Content.GetHeaders(RequestHeaders);
+        RequestHeaders.Clear();
+        RequestHeaders.Add('Content-Type', 'application/json');
+        PutRequest.Content := Content;
+
+        if not Client.Send(PutRequest, Response) then
+            Error('Failed to connect to GitHub during upload. Check network or URL: %1', Url);
+
+        if not Response.IsSuccessStatusCode() then begin
+            Response.Content.ReadAs(ResponseText);
+            Error('Failed to upload attachment: %1\\%2', Response.ReasonPhrase, ResponseText);
+        end;
+
+        Response.Content.ReadAs(ResponseText);
+        if not JsonObj.ReadFrom(ResponseText) then
+            Error('Invalid GitHub response format: %1', ResponseText);
+
+        if not JsonObj.Get('content', JsonToken) then
+            Error('Missing content in GitHub response: %1', ResponseText);
+
+        if not JsonToken.AsObject().Get('download_url', JsonToken) then
+            Error('Missing download_url in GitHub response: %1', ResponseText);
+
+        exit(JsonToken.AsValue().AsText());
+    end;
+
+    local procedure ReplaceBase64WithUrls(Body: Text; var Attachment: Record "BCY GitHub Issue Attachment"; DownloadURL: Text): Text
+    var
+        uniqueAttr: Text;
+        pos: Integer;
+        startTag: Text;
+        endTag: Text;
+        startPos: Integer;
+        endPos: Integer;
+        tagEnd: Integer;
+        Replacement: Text;
+    begin
+        uniqueAttr := 'data:' + Attachment.MimeType + ';base64,' + Attachment.GetCommentHtmlBody() + '"';
+        pos := Body.IndexOf(uniqueAttr);
+        if pos = 0 then
+            exit(Body);
+
+        if Attachment.MimeType.Contains('image') then begin
+            startTag := '<img';
+            endTag := '>';
+            Replacement := '!' + '[' + Attachment.FileName + '](' + DownloadURL + ')';
+        end else begin
+            startTag := '<a';
+            endTag := '</a>';
+            Replacement := '[' + Attachment.FileName + '](' + DownloadURL + ')';
+        end;
+
+        startPos := Body.SubString(1, pos).LastIndexOf(startTag);
+        if startPos = 0 then
+            exit(Body);
+        endPos := Body.IndexOf(endTag, pos);
+        if endPos = 0 then
+            exit(Body);
+
+        if Attachment.MimeType.Contains('image') then
+            tagEnd := endPos
+        else
+            tagEnd := endPos + 3;
+
+        exit(Body.SubString(1, startPos - 1) + Replacement + Body.SubString(tagEnd + 1, StrLen(Body) - tagEnd));
+    end;
+
+    local procedure RemoveAttributes(Body: Text): Text
+    var
+        AttributeStart: Integer;
+        AttributeEnd: Integer;
+        TempBody: Text;
+    begin
+        TempBody := Body;
+
+        AttributeStart := STRPOS(TempBody, 'alt="');
+        while AttributeStart > 0 do begin
+            AttributeEnd := STRPOS(COPYSTR(TempBody, AttributeStart + 5), '"');
+            if AttributeEnd > 0 then begin
+                AttributeEnd := AttributeStart + 5 + AttributeEnd;
+                TempBody := COPYSTR(TempBody, 1, AttributeStart - 1) + COPYSTR(TempBody, AttributeEnd + 1);
+            end;
+            AttributeStart := STRPOS(TempBody, 'alt="');
+        end;
+
+        AttributeStart := STRPOS(TempBody, 'style="');
+        while AttributeStart > 0 do begin
+            AttributeEnd := STRPOS(COPYSTR(TempBody, AttributeStart + 7), '"');
+            if AttributeEnd > 0 then begin
+                AttributeEnd := AttributeStart + 7 + AttributeEnd;
+                TempBody := COPYSTR(TempBody, 1, AttributeStart - 1) + COPYSTR(TempBody, AttributeEnd + 1);
+            end;
+            AttributeStart := STRPOS(TempBody, 'style="');
+        end;
+
+        exit(TempBody);
+    end;
+
+    local procedure FormatBody(Body: Text): Text
+    var
+        CleanedBody: Text;
+        CRLF: Text[2];
+    begin
+        CRLF[1] := 13;
+        CRLF[2] := 10;
+
+        CleanedBody := Body;
+        CleanedBody := STRSUBSTNO(CleanedBody, '  ', ' ');
+        CleanedBody := DELCHR(CleanedBody, '=', CRLF);
+        CleanedBody := STRSUBSTNO(CleanedBody, '\n\n\n', '\n\n');
+        CleanedBody := Body.Replace('<br>', '\n');
+        exit(CleanedBody);
+    end;
+}
